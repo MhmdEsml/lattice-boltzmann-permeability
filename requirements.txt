@@ -1,0 +1,7 @@
+# Core
+jax>=0.4.25
+jaxlib>=0.4.25
+numpy>=1.24
+
+# Optional — connectivity check in compute_permeability
+scipy>=1.11
