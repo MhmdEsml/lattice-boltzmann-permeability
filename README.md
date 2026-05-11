@@ -93,16 +93,6 @@ All three return a dict with keys: `permeability`, `mean_velocity`, `porosity`, 
 | `make_sphere_pack(shape, n_spheres, ...)` | Random overlapping sphere pack |
 | `test_square_duct(shape, wall_thickness, ...)` | Validate against analytical solution |
 
-## Memory Guide
-
-| Grid | Batch size | f-array memory |
-|---|---|---|
-| 32³ | 16 | ~115 MB |
-| 64³ | 8 | ~120 MB |
-| 128³ | 2 | ~240 MB |
-
-Memory per chunk: `batch_size × Nx × Ny × Nz × 19 × 4 bytes`
-
 ## Device Support
 
 JAX automatically detects available hardware. No code changes are needed when switching between CPU, GPU, and TPU — the same API works across all backends.
