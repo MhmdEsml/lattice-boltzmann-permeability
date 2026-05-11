@@ -122,7 +122,3 @@ JAX automatically detects available hardware. No code changes are needed when sw
 - Succi (2001) *The Lattice Boltzmann Equation*, Oxford UP
 - Qian et al. (1992) *Europhys. Lett.* **17**(6), 479
 - Shah & London (1978) *Laminar Flow Forced Convection in Ducts*
-
-## License
-
-MIT License — see [LICENSE](LICENSE) for details.
