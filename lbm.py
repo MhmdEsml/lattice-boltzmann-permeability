@@ -704,6 +704,7 @@ def compute_permeability_batch_multi(
     check_every: int       = 500,
     batch_size_per_device: int = 4,
     verbose: bool          = True,
+    progress: bool         = False,
 ) -> dict:
     """
     Compute permeability across all available devices (GPUs/TPUs).
@@ -733,6 +734,7 @@ def compute_permeability_batch_multi(
                             Tune to fit per-device memory:
                               mem ≈ batch_size_per_device × N × 19 × 4 bytes
     verbose               : print per-sample and per-round summary
+    progress              : show a tqdm progress bar over samples
 
     Returns
     -------
@@ -794,6 +796,10 @@ def compute_permeability_batch_multi(
         print(f"Grid          : {Nx}×{Ny}×{Nz}  |  dir={direction}  "
               f"|  τ={tau:.4f}  |  F={force_mag:.1e}")
         print("-" * 60)
+
+    if progress:
+        from tqdm import tqdm
+        pbar = tqdm(total=B, unit="sample", desc="LBM")
 
     for round_idx in range(n_rounds):
         r_start = round_idx * round_size
@@ -862,6 +868,19 @@ def compute_permeability_batch_multi(
                       f"φ={porosities[i]:.3f}  "
                       f"k={permeabilities[i]:.4e} lu²  "
                       f"Ma={machs[i]:.4f}")
+
+            if progress:
+                status = "✓" if convergeds_np[j] else "✗"
+                pbar.set_postfix(
+                    status=status,
+                    iters=int(iterations_np[j]),
+                    k=f"{permeabilities[i]:.3e}",
+                    Ma=f"{machs[i]:.4f}",
+                )
+                pbar.update(1)
+
+    if progress:
+        pbar.close()
 
     return dict(
         permeability  = permeabilities,
