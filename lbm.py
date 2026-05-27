@@ -795,7 +795,7 @@ def compute_permeability_batch_multi(
 
     if progress:
         from tqdm import tqdm
-        pbar = tqdm(total=B, unit="sample", desc="LBM")
+        pbar = tqdm(total=n_rounds, unit="round", desc="LBM")
 
     for round_idx in range(n_rounds):
         r_start = round_idx * round_size
@@ -866,8 +866,6 @@ def compute_permeability_batch_multi(
                       f"Ma={machs[i]:.4f}")
 
         if progress:
-            # Update once per round (all samples in a round run in parallel,
-            # so per-sample updates would only flush after compute anyway)
             last_j = n_real - 1
             last_i = r_start + last_j
             status = "✓" if convergeds_np[last_j] else "✗"
@@ -877,7 +875,7 @@ def compute_permeability_batch_multi(
                 k=f"{permeabilities[last_i]:.3e}",
                 Ma=f"{machs[last_i]:.4f}",
             )
-            pbar.update(n_real)
+            pbar.update(1)
 
     if progress:
         pbar.close()
