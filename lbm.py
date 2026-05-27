@@ -762,10 +762,11 @@ def compute_permeability_batch_multi(
     F_np        = np.zeros(3, dtype=np.float32)
     F_np[d_idx] = force_mag
 
-    # Build neighbour table once on CPU, replicate to all devices
-    nb_np      = np.asarray(build_neighbour_table(Nx, Ny, Nz))  # (N, 19)
-    nb_rep     = jax.device_put(jnp.array(nb_np), jax.sharding.PositionalSharding(devices).replicate())
-    F_rep      = jax.device_put(jnp.array(F_np),  jax.sharding.PositionalSharding(devices).replicate())
+    nb_np  = np.asarray(build_neighbour_table(Nx, Ny, Nz))
+    _mesh  = jax.sharding.Mesh(np.array(devices), ("d",))
+    _rep   = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec())
+    nb_rep = jax.device_put(jnp.array(nb_np), _rep)
+    F_rep  = jax.device_put(jnp.array(F_np),  _rep)
 
     solids_np  = rocks.astype(bool).reshape(B, N)   # (B, N)
 
