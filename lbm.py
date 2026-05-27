@@ -764,8 +764,8 @@ def compute_permeability_batch_multi(
 
     # Build neighbour table once on CPU, replicate to all devices
     nb_np      = np.asarray(build_neighbour_table(Nx, Ny, Nz))  # (N, 19)
-    nb_rep     = jax.device_put_replicated(jnp.array(nb_np),    devices)
-    F_rep      = jax.device_put_replicated(jnp.array(F_np),     devices)
+    nb_rep     = jax.device_put(jnp.array(nb_np),    devices)
+    F_rep      = jax.device_put(jnp.array(F_np),     devices)
 
     solids_np  = rocks.astype(bool).reshape(B, N)   # (B, N)
 
