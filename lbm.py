@@ -669,7 +669,6 @@ def _run_chunk_pmap(
     """
     def _one_device(solids_dev, nb_dev, F_dev):
         """Runs on a single device — vmaps C samples."""
-        C = solids_dev.shape[0]
         f_init = jnp.where(
             solids_dev[:, :, None],
             jnp.float32(0.0),
@@ -677,7 +676,6 @@ def _run_chunk_pmap(
         )   # (C, N, 19)
 
         def _run_one(f_init_i, solid_i):
-            @jax.jit
             def step(f):
                 f = _collide(f, tau, F_dev, solid_i)
                 f = _stream(f, solid_i, nb_dev)
@@ -688,9 +686,7 @@ def _run_chunk_pmap(
 
         return jax.vmap(_run_one, in_axes=(0, 0))(f_init, solids_dev)
 
-    # pmap maps _one_device over axis 0 of each argument (the device axis)
-    pmapped = jax.pmap(_one_device, in_axes=(0, 0, 0))
-    return pmapped(solids_chunk, nb_rep, F_rep)
+    return jax.pmap(_one_device, in_axes=(0, 0, 0))(solids_chunk, nb_rep, F_rep)
 
 
 def compute_permeability_batch_multi(
@@ -869,15 +865,19 @@ def compute_permeability_batch_multi(
                       f"k={permeabilities[i]:.4e} lu²  "
                       f"Ma={machs[i]:.4f}")
 
-            if progress:
-                status = "✓" if convergeds_np[j] else "✗"
-                pbar.set_postfix(
-                    status=status,
-                    iters=int(iterations_np[j]),
-                    k=f"{permeabilities[i]:.3e}",
-                    Ma=f"{machs[i]:.4f}",
-                )
-                pbar.update(1)
+        if progress:
+            # Update once per round (all samples in a round run in parallel,
+            # so per-sample updates would only flush after compute anyway)
+            last_j = n_real - 1
+            last_i = r_start + last_j
+            status = "✓" if convergeds_np[last_j] else "✗"
+            pbar.set_postfix(
+                status=status,
+                iters=int(iterations_np[last_j]),
+                k=f"{permeabilities[last_i]:.3e}",
+                Ma=f"{machs[last_i]:.4f}",
+            )
+            pbar.update(n_real)
 
     if progress:
         pbar.close()
