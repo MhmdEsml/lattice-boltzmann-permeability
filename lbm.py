@@ -23,7 +23,7 @@ Device strategy
   batch_size_per_device controls how many samples run in parallel on each device.
   Total parallelism = n_devices × batch_size_per_device.
 
-  Example — 4 GPUs, batch_size_per_device=8, 100 samples:
+  Example — 4 devices, batch_size_per_device=8, 100 samples:
     Round 1: devices 0-3 each run 8 samples (32 total) via pmap+vmap
     Round 2: same
     Round 3: same
@@ -78,7 +78,6 @@ _OPPOSITE_np = np.array(
     dtype=np.int32)
 OPPOSITE = jnp.array(_OPPOSITE_np)         # (19,)
 
-
 # ── Neighbour table ────────────────────────────────────────────────────────────
 
 def build_neighbour_table(Nx: int, Ny: int, Nz: int) -> jnp.ndarray:
@@ -105,7 +104,6 @@ def build_neighbour_table(Nx: int, Ny: int, Nz: int) -> jnp.ndarray:
         ).reshape(-1)
 
     return jnp.array(nb)   # (N, 19) on device
-
 
 # ── Fused collision (macroscopic + equilibrium + Guo + BGK) ───────────────────
 
@@ -147,50 +145,41 @@ def _collide(f: jnp.ndarray, tau: float,
     f_post = f - (f - feq) / tau + S
     return jnp.where(solid[:, None], f, f_post)
 
-
 # ── Pull streaming + halfway bounce-back ──────────────────────────────────────
 
 def _stream(f: jnp.ndarray, solid: jnp.ndarray,
-            nb: jnp.ndarray) -> jnp.ndarray:
-    """
-    Parameters
-    ----------
-    f     : (N, 19)
-    solid : (N,)   bool
-    nb    : (N, 19) int32  neighbour table
-
-    Returns
-    -------
-    f_new : (N, 19)
-    """
-    # Pull each population from its upstream neighbour
-    f_pull = f[nb, jnp.arange(Q)]          # (N, 19)
-
-    # Halfway bounce-back: upstream is solid AND current node is fluid
-    src_solid = solid[nb]                  # (N, 19)
-    bounce    = src_solid & ~solid[:, None]
-    f_new     = jnp.where(bounce, f[:, OPPOSITE], f_pull)
-
-    # Solid nodes carry no populations
-    return jnp.where(solid[:, None], jnp.float32(0.0), f_new)
-
+            Nx: int, Ny: int, Nz: int) -> jnp.ndarray:
+    f4    = f.reshape(Nx, Ny, Nz, Q)        # (Nx, Ny, Nz, 19)
+    s4    = solid.reshape(Nx, Ny, Nz)       # (Nx, Ny, Nz)
+    f_new = jnp.zeros_like(f4)
+    for q in range(Q):
+        ex, ey, ez = int(_E_np[q, 0]), int(_E_np[q, 1]), int(_E_np[q, 2])
+        f_shifted  = jnp.roll(f4[..., q], shift=(ex, ey, ez), axis=(0, 1, 2))
+        src_solid  = jnp.roll(s4, shift=(ex, ey, ez), axis=(0, 1, 2))
+        bounce     = src_solid & ~s4
+        f_q        = jnp.where(bounce, f4[..., OPPOSITE[q]], f_shifted)
+        f_new      = f_new.at[..., q].set(f_q)
+    # Zero out solid nodes
+    f_new = jnp.where(s4[..., None], jnp.float32(0.0), f_new)
+    return f_new.reshape(-1, Q)             # back to (N, 19)
 
 # ── Step function factory ──────────────────────────────────────────────────────
 
 def make_step_fn(tau: float, solid: jnp.ndarray,
-                 nb: jnp.ndarray, F: jnp.ndarray):
+                 F: jnp.ndarray,
+                 Nx: int, Ny: int, Nz: int):
     """
     Return a JIT-compiled step function.
 
-    All static data (solid, nb, F, tau) are closed over so XLA treats them
+    All static data (solid, F, tau) are closed over so XLA treats them
     as compile-time constants — no per-step transfer overhead.
 
     Parameters
     ----------
-    tau   : relaxation time (Python float, baked in at compile time)
-    solid : (N,)    bool device array
-    nb    : (N, 19) int32 device array
-    F     : (3,)    float32 device array
+    tau        : relaxation time (Python float, baked in at compile time)
+    solid      : (N,)    bool device array
+    F          : (3,)    float32 device array
+    Nx, Ny, Nz : grid dims
 
     Returns
     -------
@@ -199,10 +188,9 @@ def make_step_fn(tau: float, solid: jnp.ndarray,
     @jax.jit
     def step(f: jnp.ndarray) -> jnp.ndarray:
         f = _collide(f, tau, F, solid)
-        f = _stream(f, solid, nb)
+        f = _stream(f, solid, Nx, Ny, Nz)
         return f
     return step
-
 
 # ── On-device while_loop ───────────────────────────────────────────────────────
 
@@ -284,7 +272,6 @@ def _run_on_device(
     f_final, it_final, _, _, converged = jax.lax.while_loop(cond, body, init)
     return f_final, it_final, converged
 
-
 # ── Post-processing helper ─────────────────────────────────────────────────────
 
 def _post_process(
@@ -332,7 +319,6 @@ def _post_process(
     return dict(permeability=k, mean_velocity=mean_u,
                 rho_mean=rho_mean, mach=mach,
                 u_flat=u_np, rho_flat=rho_np)
-
 
 # ── Single-sample solver ───────────────────────────────────────────────────────
 
@@ -403,8 +389,7 @@ def compute_permeability(
     F_np[d_idx]   = force_mag
     F             = jnp.array(F_np)
     solid_dev     = jnp.array(solid_np)
-    nb            = build_neighbour_table(Nx, Ny, Nz)
-    step          = make_step_fn(tau, solid_dev, nb, F)
+    step          = make_step_fn(tau, solid_dev, F, Nx, Ny, Nz)
 
     f_init = jnp.where(solid_dev[:, None],
                        jnp.float32(0.0),
@@ -442,18 +427,19 @@ def compute_permeability(
         rho_field     = pp["rho_flat"].reshape(Nx, Ny, Nz),
     )
 
-
 # ── Batch solver ───────────────────────────────────────────────────────────────
 
 def _run_chunk(
     solids_chunk: jnp.ndarray,
-    nb: jnp.ndarray,
     F: jnp.ndarray,
     tau: float,
     d_idx: int,
     check_every: int,
     tol: float,
     max_iter: int,
+    Nx: int,
+    Ny: int,
+    Nz: int,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     vmap a single chunk of samples on-device.
@@ -461,9 +447,9 @@ def _run_chunk(
     Parameters
     ----------
     solids_chunk : (C, N) bool   — C = chunk size
-    nb           : (N, 19) int32
     F            : (3,)
     tau, d_idx, check_every, tol, max_iter : scalars
+    Nx, Ny, Nz   : grid dims
 
     Returns
     -------
@@ -472,7 +458,7 @@ def _run_chunk(
     convergeds : (C,)
     """
     C = solids_chunk.shape[0]
-    N = nb.shape[0]
+    N = Nx * Ny * Nz
 
     f_init_chunk = jnp.where(
         solids_chunk[:, :, None],
@@ -481,16 +467,14 @@ def _run_chunk(
     )   # (C, N, 19)
 
     def _run_one(f_init: jnp.ndarray, solid: jnp.ndarray):
-        @jax.jit
         def step(f):
             f = _collide(f, tau, F, solid)
-            f = _stream(f, solid, nb)
+            f = _stream(f, solid, Nx, Ny, Nz)
             return f
         return _run_on_device(f_init, step, solid, d_idx,
                               check_every, tol, max_iter)
 
     return jax.vmap(_run_one, in_axes=(0, 0))(f_init_chunk, solids_chunk)
-
 
 def compute_permeability_batch(
     rocks: np.ndarray,
@@ -524,7 +508,7 @@ def compute_permeability_batch(
     check_every : steps between convergence checks
     batch_size  : number of samples per vmap chunk.
                   None  → run all B samples in one chunk (original behaviour).
-                  Tune this to fit GPU memory:
+                  Tune this to fit device memory:
                     memory per chunk ≈ batch_size × N × 19 × 4 bytes
                   Example: 64³ grid, batch_size=8 → ~120 MB per chunk.
     verbose     : print per-sample summary
@@ -559,9 +543,7 @@ def compute_permeability_batch(
     F_np[d_idx] = force_mag
     F           = jnp.array(F_np)
 
-    # Build neighbour table once — shared across all chunks
-    nb         = build_neighbour_table(Nx, Ny, Nz)          # (N, 19)
-    solids_np  = rocks.astype(bool).reshape(B, N)           # (B, N)
+    solids_np  = rocks.astype(bool).reshape(B, N)
 
     # Output arrays — filled chunk by chunk
     permeabilities  = np.empty(B, dtype=np.float64)
@@ -596,8 +578,8 @@ def compute_permeability_batch(
         solids_chunk = jnp.array(solids_np[start:end])      # (C, N)
 
         f_finals, it_finals, convergeds = _run_chunk(
-            solids_chunk, nb, F, tau, d_idx,
-            check_every, tol, max_iter)
+            solids_chunk, F, tau, d_idx,
+            check_every, tol, max_iter, Nx, Ny, Nz)
 
         # Transfer to host
         f_finals_np   = np.asarray(f_finals)    # (C, N, 19)
@@ -642,11 +624,11 @@ def compute_permeability_batch(
         rho_field     = rho_fields,
     )
 
-
 # ── Multi-device batch solver (pmap over devices, vmap within) ─────────────────
 
 @functools.lru_cache(maxsize=None)
-def _make_step_pmap(tau: float, d_idx: int, check_every: int):
+def _make_step_pmap(tau: float, d_idx: int, check_every: int,
+                    Nx: int = 0, Ny: int = 0, Nz: int = 0):
     """
     Build and cache a pmap+vmap function that advances f by check_every
     LBM steps and returns (f, u_means).
@@ -655,20 +637,19 @@ def _make_step_pmap(tau: float, d_idx: int, check_every: int):
     iteration of the Python convergence loop.
 
     Signature of returned function:
-        step_pmap(f, solids, nb, F)
+        step_pmap(f, solids, F)
             f      : (D, C, N, 19)
             solids : (D, C, N)
-            nb     : (D, N, 19)
             F      : (D, 3)
         returns:
             f_new  : (D, C, N, 19)
-            u_means: (D, C)        mean velocity per sample
+            u_means: (D, C)
     """
-    def _one_device(f_dev, solids_dev, nb_dev, F_dev):
+    def _one_device(f_dev, solids_dev, F_dev):
         def _run_one(f_i, solid_i):
             def step(f):
                 f = _collide(f, tau, F_dev, solid_i)
-                f = _stream(f, solid_i, nb_dev)
+                f = _stream(f, solid_i, Nx, Ny, Nz)
                 return f
             f_i = jax.lax.fori_loop(0, check_every, lambda _, fi: step(fi), f_i)
             fluid_mask = (~solid_i).astype(jnp.float32)
@@ -676,8 +657,7 @@ def _make_step_pmap(tau: float, d_idx: int, check_every: int):
             return f_i, u_mean
         return jax.vmap(_run_one, in_axes=(0, 0))(f_dev, solids_dev)
 
-    return jax.pmap(_one_device, in_axes=(0, 0, 0, 0))
-
+    return jax.pmap(_one_device, in_axes=(0, 0, 0))
 
 def compute_permeability_batch_multi(
     rocks: np.ndarray,
@@ -691,9 +671,10 @@ def compute_permeability_batch_multi(
     batch_size_per_device: int = 4,
     verbose: bool          = True,
     progress: bool         = False,
+    debug_convergence: bool = False,
 ) -> dict:
     """
-    Compute permeability across all available devices (GPUs/TPUs).
+    Compute permeability across all available devices.
 
     Architecture
     ------------
@@ -717,7 +698,7 @@ def compute_permeability_batch_multi(
     check_every           : steps between convergence checks
     batch_size_per_device : samples processed in parallel on each device.
                             Total parallelism = n_devices × batch_size_per_device.
-                            Tune to fit per-device memory:
+                            Tune to fit device memory:
                               mem ≈ batch_size_per_device × N × 19 × 4 bytes
     verbose               : print per-sample and per-round summary
     progress              : show a tqdm progress bar over samples
@@ -750,9 +731,7 @@ def compute_permeability_batch_multi(
     F_np        = np.zeros(3, dtype=np.float32)
     F_np[d_idx] = force_mag
 
-    nb_np  = np.asarray(build_neighbour_table(Nx, Ny, Nz))
-    nb_rep = jnp.array(np.stack([nb_np] * n_devices))
-    F_rep  = jnp.array(np.stack([F_np]  * n_devices))
+    F_rep  = jnp.array(np.stack([F_np] * n_devices))
 
     solids_np  = rocks.astype(bool).reshape(B, N)   # (B, N)
 
@@ -787,7 +766,8 @@ def compute_permeability_batch_multi(
         from tqdm import tqdm
         pbar = tqdm(total=max_iter, unit="step", desc="LBM")
 
-    step_pmap = _make_step_pmap(tau, d_idx, check_every)
+    # Get the cached pmap+vmap step function (compiles once)
+    step_pmap = _make_step_pmap(tau, d_idx, check_every, Nx, Ny, Nz)
 
     for round_idx in range(n_rounds):
         r_start = round_idx * round_size
@@ -838,8 +818,9 @@ def compute_permeability_batch_multi(
             if convergeds_np[:n_real].all():
                 break
 
-            f_dc, u_means = step_pmap(f_dc, solids_dc, nb_rep, F_rep)
-            u_means_flat = np.asarray(u_means).reshape(round_size)
+            f_dc, u_means = step_pmap(f_dc, solids_dc, F_rep)
+            # u_means : (D, C)
+            u_means_flat = np.asarray(u_means).reshape(round_size)  # host sync
 
             it = (check_idx + 1) * check_every
 
@@ -863,6 +844,18 @@ def compute_permeability_batch_multi(
                 if n_hits[j] >= n_hits_req:
                     convergeds_np[j] = True
                     iterations_np[j] = it
+
+            if debug_convergence:
+                parts = []
+                for j in range(n_real):
+                    if convergeds_np[j]:
+                        parts.append(f"s{j}=✓")
+                    else:
+                        um = float(u_means_flat[j])
+                        u_new = ema_alpha * um + (1.0 - ema_alpha) * u_ema[j]
+                        err = abs(u_new - u_ema[j]) / (abs(u_ema[j]) + 1e-30)
+                        parts.append(f"s{j}={err:.2e}({err/tol:.1f}x tol)")
+                print(f"  [iter {it:6d}] " + "  ".join(parts), flush=True)
 
             if progress:
                 n_converged = int(convergeds_np[:n_real].sum())
