@@ -429,52 +429,44 @@ def compute_permeability(
 
 # ── Batch solver ───────────────────────────────────────────────────────────────
 
-def _run_chunk(
-    solids_chunk: jnp.ndarray,
+def _step_chunk(
+    f: jnp.ndarray,
+    solids: jnp.ndarray,
     F: jnp.ndarray,
     tau: float,
     d_idx: int,
     check_every: int,
-    tol: float,
-    max_iter: int,
     Nx: int,
     Ny: int,
     Nz: int,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    vmap a single chunk of samples on-device.
+    Advance all slots by check_every LBM steps and return mean velocities.
 
     Parameters
     ----------
-    solids_chunk : (C, N) bool   — C = chunk size
-    F            : (3,)
-    tau, d_idx, check_every, tol, max_iter : scalars
-    Nx, Ny, Nz   : grid dims
+    f       : (C, N, 19)
+    solids  : (C, N) bool
+    F       : (3,)
+    tau, d_idx, check_every : scalars
+    Nx, Ny, Nz : grid dims
 
     Returns
     -------
-    f_finals   : (C, N, 19)
-    it_finals  : (C,)
-    convergeds : (C,)
+    f_new    : (C, N, 19)
+    u_means  : (C,)
     """
-    C = solids_chunk.shape[0]
-    N = Nx * Ny * Nz
-
-    f_init_chunk = jnp.where(
-        solids_chunk[:, :, None],
-        jnp.float32(0.0),
-        W[None, None, :]
-    )   # (C, N, 19)
-
-    def _run_one(f_init: jnp.ndarray, solid: jnp.ndarray):
+    def _run_one(f_i: jnp.ndarray, solid_i: jnp.ndarray):
         def step(f):
-            f = _collide(f, tau, F, solid)
-            f = _stream(f, solid, Nx, Ny, Nz)
+            f = _collide(f, tau, F, solid_i)
+            f = _stream(f, solid_i, Nx, Ny, Nz)
             return f
-        return _run_on_device(f_init, step, solid, d_idx,
-                              check_every, tol, max_iter)
+        f_i = jax.lax.fori_loop(0, check_every, lambda _, fi: step(fi), f_i)
+        fluid_mask = (~solid_i).astype(jnp.float32)
+        u_mean = ((f_i @ E[:, d_idx]) * fluid_mask).sum() / jnp.float32(solid_i.shape[0])
+        return f_i, u_mean
 
-    return jax.vmap(_run_one, in_axes=(0, 0))(f_init_chunk, solids_chunk)
+    return jax.vmap(_run_one, in_axes=(0, 0))(f, solids)
 
 def compute_permeability_batch(
     rocks: np.ndarray,
@@ -491,10 +483,10 @@ def compute_permeability_batch(
     """
     Compute permeability for a collection of same-shape samples.
 
-    Internally splits the collection into chunks of `batch_size` and runs
-    each chunk with jax.vmap (all samples in a chunk run in parallel on-device).
-    The neighbour table and compiled step function are built once and reused
-    across all chunks.
+    Runs batch_size samples in parallel via jax.vmap. Each sample is tracked
+    independently: as soon as a slot converges it is post-processed and
+    replaced with the next queued sample, so the device stays fully occupied
+    until all samples are done.
 
     Parameters
     ----------
@@ -502,15 +494,13 @@ def compute_permeability_batch(
     direction   : 'x', 'y', or 'z'
     nu          : kinematic viscosity in lattice units (default 1/6 → τ=1)
     force_mag   : body-force magnitude (keep << 1 for low Mach)
-    max_iter    : hard iteration cap — all samples in a chunk run this many
-                  steps (vmap lockstep); set generously for high-porosity rocks
+    max_iter    : hard iteration cap per sample
     tol         : EMA convergence tolerance
     check_every : steps between convergence checks
-    batch_size  : number of samples per vmap chunk.
-                  None  → run all B samples in one chunk (original behaviour).
-                  Tune this to fit device memory:
-                    memory per chunk ≈ batch_size × N × 19 × 4 bytes
-                  Example: 64³ grid, batch_size=8 → ~120 MB per chunk.
+    batch_size  : number of slots run in parallel.
+                  None → min(B, 8).
+                  Tune to fit device memory:
+                    memory ≈ batch_size × N × 19 × 4 bytes
     verbose     : print per-sample summary
 
     Returns
@@ -529,9 +519,8 @@ def compute_permeability_batch(
     B, Nx, Ny, Nz = rocks.shape
     N = Nx * Ny * Nz
 
-    # Default: one chunk = whole batch
     if batch_size is None:
-        batch_size = B
+        batch_size = min(B, 8)
     batch_size = min(batch_size, B)
 
     tau = float(nu) / float(cs2) + 0.5
@@ -543,9 +532,8 @@ def compute_permeability_batch(
     F_np[d_idx] = force_mag
     F           = jnp.array(F_np)
 
-    solids_np  = rocks.astype(bool).reshape(B, N)
+    solids_np = rocks.astype(bool).reshape(B, N)
 
-    # Output arrays — filled chunk by chunk
     permeabilities  = np.empty(B, dtype=np.float64)
     mean_velocities = np.empty(B, dtype=np.float64)
     porosities      = np.empty(B, dtype=np.float64)
@@ -555,63 +543,131 @@ def compute_permeability_batch(
     u_fields        = np.empty((B, Nx, Ny, Nz, 3), dtype=np.float32)
     rho_fields      = np.empty((B, Nx, Ny, Nz),    dtype=np.float32)
 
-    n_chunks = int(np.ceil(B / batch_size))
-
     if verbose:
         mem_mb = batch_size * N * 19 * 4 / 1024**2
-        print(f"Total samples : {B}  |  chunk size : {batch_size}  "
-              f"|  chunks : {n_chunks}")
+        print(f"Total samples : {B}  |  slots : {batch_size}")
         print(f"Grid          : {Nx}×{Ny}×{Nz}  |  dir={direction}  "
               f"|  τ={tau:.4f}  |  F={force_mag:.1e}")
-        print(f"Memory/chunk  : ~{mem_mb:.0f} MB  (f array only)")
+        print(f"Memory        : ~{mem_mb:.0f} MB  (f array only)")
         print("-" * 60)
 
-    for chunk_idx in range(n_chunks):
-        start = chunk_idx * batch_size
-        end   = min(start + batch_size, B)
-        C     = end - start   # actual chunk size (last chunk may be smaller)
+    # Initialise slots with the first batch_size samples
+    next_sample = batch_size
+    slot_sample = list(range(batch_size))          # slot j → global sample index
 
-        if verbose:
-            print(f"Chunk {chunk_idx + 1}/{n_chunks}  "
-                  f"(samples {start}–{end - 1}) …", flush=True)
+    solids_slots = np.array(solids_np[:batch_size])        # (C, N)
+    f_slots      = np.where(
+        solids_slots[:, :, None],
+        np.float32(0.0),
+        np.broadcast_to(np.asarray(W)[None, None, :], (batch_size, N, Q)).copy(),
+    ).astype(np.float32)
 
-        solids_chunk = jnp.array(solids_np[start:end])      # (C, N)
+    u_ema  = np.full(batch_size, np.nan, dtype=np.float64)
+    n_hits = np.zeros(batch_size, dtype=np.int32)
+    iters  = np.zeros(batch_size, dtype=np.int32)
 
-        f_finals, it_finals, convergeds = _run_chunk(
-            solids_chunk, F, tau, d_idx,
-            check_every, tol, max_iter, Nx, Ny, Nz)
+    n_done    = 0
+    n_checks  = int(np.ceil(max_iter / check_every))
 
-        # Transfer to host
-        f_finals_np   = np.asarray(f_finals)    # (C, N, 19)
-        iterations_np = np.asarray(it_finals)   # (C,)
-        convergeds_np = np.asarray(convergeds)  # (C,)
+    for check_idx in range(n_checks):
+        if n_done == B:
+            break
 
-        # Post-process each sample in the chunk
-        for j in range(C):
-            i       = start + j
-            solid_i = solids_np[i]
-            pp = _post_process(f_finals_np[j], solid_i, F_np,
-                               d_idx, nu, force_mag)
+        f_dev, u_means_dev = _step_chunk(
+            jnp.array(f_slots),
+            jnp.array(solids_slots),
+            F, tau, d_idx, check_every, Nx, Ny, Nz,
+        )
+        f_slots   = np.asarray(f_dev)
+        u_means   = np.asarray(u_means_dev)
+        it        = (check_idx + 1) * check_every
 
-            permeabilities[i]  = pp["permeability"]
-            mean_velocities[i] = pp["mean_velocity"]
-            porosities[i]      = float((~solid_i).mean())
-            machs[i]           = pp["mach"]
-            iterations_out[i]  = iterations_np[j]
-            convergeds_out[i]  = convergeds_np[j]
-            u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
-            rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
+        for j in range(batch_size):
+            i = slot_sample[j]
+            if i == -1:
+                continue
 
-            if pp["mach"] > 0.1:
-                print(f"  WARNING sample {i}: Mach={pp['mach']:.3f}. "
-                      f"Reduce force_mag.")
+            um = float(u_means[j])
+            if np.isnan(u_ema[j]):
+                u_ema[j] = um
+            else:
+                u_new     = 0.1 * um + 0.9 * u_ema[j]
+                rel_err   = abs(u_new - u_ema[j]) / (abs(u_ema[j]) + 1e-30)
+                u_ema[j]  = u_new
 
-            if verbose:
-                status = "✓" if convergeds_np[j] else "✗"
-                print(f"  [{i:3d}] {status}  iters={iterations_np[j]:6d}  "
-                      f"φ={porosities[i]:.3f}  "
-                      f"k={permeabilities[i]:.4e} lu²  "
-                      f"Ma={machs[i]:.4f}")
+                if rel_err < tol:
+                    n_hits[j] += 1
+                else:
+                    n_hits[j] = 0
+
+                if n_hits[j] >= 3:
+                    iters[j] = it
+                    pp = _post_process(f_slots[j], solids_np[i], F_np,
+                                       d_idx, nu, force_mag)
+
+                    permeabilities[i]  = pp["permeability"]
+                    mean_velocities[i] = pp["mean_velocity"]
+                    porosities[i]      = float((~solids_np[i]).mean())
+                    machs[i]           = pp["mach"]
+                    iterations_out[i]  = it
+                    convergeds_out[i]  = True
+                    u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
+                    rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
+
+                    if pp["mach"] > 0.1:
+                        print(f"  WARNING sample {i}: Mach={pp['mach']:.3f}. "
+                              f"Reduce force_mag.")
+                    if verbose:
+                        print(f"  [{i:3d}] ✓  iters={it:6d}  "
+                              f"φ={porosities[i]:.3f}  "
+                              f"k={permeabilities[i]:.4e} lu²  "
+                              f"Ma={machs[i]:.4f}  "
+                              f"[slot {j} → ", end="")
+
+                    n_done += 1
+
+                    if next_sample < B:
+                        ni = next_sample
+                        next_sample += 1
+                        slot_sample[j] = ni
+                        solids_slots[j] = solids_np[ni]
+                        f_slots[j]      = np.where(
+                            solids_np[ni, :, None],
+                            np.float32(0.0),
+                            np.asarray(W),
+                        ).astype(np.float32)
+                        u_ema[j]  = np.nan
+                        n_hits[j] = 0
+                        iters[j]  = 0
+                        if verbose:
+                            print(f"sample {ni}]", flush=True)
+                    else:
+                        slot_sample[j] = -1
+                        if verbose:
+                            print("idle]", flush=True)
+
+        # Handle samples that hit max_iter without converging
+        if it >= max_iter:
+            for j in range(batch_size):
+                i = slot_sample[j]
+                if i == -1:
+                    continue
+                pp = _post_process(f_slots[j], solids_np[i], F_np,
+                                   d_idx, nu, force_mag)
+                permeabilities[i]  = pp["permeability"]
+                mean_velocities[i] = pp["mean_velocity"]
+                porosities[i]      = float((~solids_np[i]).mean())
+                machs[i]           = pp["mach"]
+                iterations_out[i]  = it
+                convergeds_out[i]  = False
+                u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
+                rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
+                if verbose:
+                    print(f"  [{i:3d}] ✗  iters={it:6d}  "
+                          f"φ={porosities[i]:.3f}  "
+                          f"k={permeabilities[i]:.4e} lu²  "
+                          f"Ma={machs[i]:.4f}")
+            break
 
     return dict(
         permeability  = permeabilities,
@@ -678,14 +734,12 @@ def compute_permeability_batch_multi(
 
     Architecture
     ------------
-    pmap  : distributes samples across devices — each device is independent,
-            no lockstep between devices.
-    vmap  : runs batch_size_per_device samples in parallel within each device —
-            lockstep within one device.
+    pmap  : distributes slots across devices.
+    vmap  : runs batch_size_per_device slots in parallel within each device.
 
-    Devices are detected automatically via jax.device_count().
-    If only 1 device is available this falls back to vmap-only behaviour
-    (equivalent to compute_permeability_batch).
+    Each slot is tracked independently. When a slot converges it is
+    post-processed and immediately replaced with the next queued sample,
+    keeping all devices occupied until every sample is done.
 
     Parameters
     ----------
@@ -696,12 +750,12 @@ def compute_permeability_batch_multi(
     max_iter              : hard iteration cap per sample
     tol                   : EMA convergence tolerance
     check_every           : steps between convergence checks
-    batch_size_per_device : samples processed in parallel on each device.
-                            Total parallelism = n_devices × batch_size_per_device.
+    batch_size_per_device : slots per device.
+                            Total slots = n_devices × batch_size_per_device.
                             Tune to fit device memory:
                               mem ≈ batch_size_per_device × N × 19 × 4 bytes
-    verbose               : print per-sample and per-round summary
-    progress              : show a tqdm progress bar over samples
+    verbose               : print per-sample summary
+    progress              : show a tqdm progress bar
 
     Returns
     -------
@@ -719,7 +773,6 @@ def compute_permeability_batch_multi(
     B, Nx, Ny, Nz = rocks.shape
     N = Nx * Ny * Nz
 
-    # ── Device detection ──────────────────────────────────────────────────────
     devices   = jax.devices()
     n_devices = len(devices)
 
@@ -731,15 +784,12 @@ def compute_permeability_batch_multi(
     F_np        = np.zeros(3, dtype=np.float32)
     F_np[d_idx] = force_mag
 
-    F_rep  = jnp.array(np.stack([F_np] * n_devices))
+    F_rep = jnp.array(np.stack([F_np] * n_devices))
 
-    solids_np  = rocks.astype(bool).reshape(B, N)   # (B, N)
+    solids_np  = rocks.astype(bool).reshape(B, N)
 
-    # Round size = all devices × per-device batch
-    round_size = n_devices * batch_size_per_device
-    n_rounds   = int(np.ceil(B / round_size))
+    total_slots = n_devices * batch_size_per_device
 
-    # Output arrays
     permeabilities  = np.empty(B, dtype=np.float64)
     mean_velocities = np.empty(B, dtype=np.float64)
     porosities      = np.empty(B, dtype=np.float64)
@@ -753,151 +803,155 @@ def compute_permeability_batch_multi(
         mem_mb = batch_size_per_device * N * 19 * 4 / 1024**2
         print(f"Devices       : {n_devices}  "
               f"({', '.join(str(d) for d in devices)})")
-        print(f"Per-device    : {batch_size_per_device} samples  "
-              f"(~{mem_mb:.0f} MB f-array per device)")
-        print(f"Round size    : {round_size} samples  "
+        print(f"Slots         : {total_slots}  "
               f"({n_devices} devices × {batch_size_per_device})")
-        print(f"Total samples : {B}  |  rounds : {n_rounds}")
+        print(f"Total samples : {B}")
         print(f"Grid          : {Nx}×{Ny}×{Nz}  |  dir={direction}  "
               f"|  τ={tau:.4f}  |  F={force_mag:.1e}")
+        print(f"Memory/device : ~{mem_mb:.0f} MB  (f array only)")
         print("-" * 60)
+
+    step_pmap = _make_step_pmap(tau, d_idx, check_every, Nx, Ny, Nz)
+
+    # Initialise slots
+    next_sample = min(total_slots, B)
+    slot_sample = list(range(next_sample)) + [-1] * (total_slots - next_sample)
+
+    W_np = np.asarray(W)
+
+    def _init_f(solid: np.ndarray) -> np.ndarray:
+        return np.where(solid[:, None], np.float32(0.0), W_np).astype(np.float32)
+
+    f_slots      = np.stack([_init_f(solids_np[i]) if i != -1
+                             else np.zeros((N, Q), np.float32)
+                             for i in slot_sample])           # (S, N, 19)
+    solids_slots = np.stack([solids_np[i] if i != -1
+                             else np.zeros(N, bool)
+                             for i in slot_sample])           # (S, N)
+
+    u_ema  = np.full(total_slots, np.nan, dtype=np.float64)
+    n_hits = np.zeros(total_slots, dtype=np.int32)
+
+    n_done   = 0
+    n_checks = int(np.ceil(max_iter / check_every))
 
     if progress:
         from tqdm import tqdm
-        pbar = tqdm(total=max_iter, unit="step", desc="LBM")
+        pbar = tqdm(total=B, unit="sample", desc="LBM")
 
-    # Get the cached pmap+vmap step function (compiles once)
-    step_pmap = _make_step_pmap(tau, d_idx, check_every, Nx, Ny, Nz)
+    for check_idx in range(n_checks):
+        if n_done == B:
+            break
 
-    for round_idx in range(n_rounds):
-        r_start = round_idx * round_size
-        r_end   = min(r_start + round_size, B)
-        n_real  = r_end - r_start
+        # Reshape to (D, C, N, 19) / (D, C, N) for pmap
+        f_dc      = jnp.array(f_slots.reshape(n_devices, batch_size_per_device, N, Q))
+        solids_dc = jnp.array(solids_slots.reshape(n_devices, batch_size_per_device, N))
 
-        if verbose:
-            print(f"Round {round_idx + 1}/{n_rounds}  "
-                  f"(samples {r_start}–{r_end - 1}) …", flush=True)
+        f_dc, u_means = step_pmap(f_dc, solids_dc, F_rep)
 
-        # Pad last round to exactly round_size
-        if n_real < round_size:
-            pad = round_size - n_real
-            solids_round = np.concatenate([
-                solids_np[r_start:r_end],
-                np.tile(solids_np[r_end - 1], (pad, 1))
-            ], axis=0)
-        else:
-            solids_round = solids_np[r_start:r_end]
+        f_slots   = np.asarray(f_dc).reshape(total_slots, N, Q)
+        u_means_f = np.asarray(u_means).reshape(total_slots)
+        it        = (check_idx + 1) * check_every
 
-        # (D, C, N)
-        solids_dc = jnp.array(
-            solids_round.reshape(n_devices, batch_size_per_device, N)
-        )
-
-        # Initialise f for all samples in this round
-        f_dc = jnp.where(
-            solids_dc[:, :, :, None],
-            jnp.float32(0.0),
-            W[None, None, None, :]
-        )   # (D, C, N, 19)
-
-        # Per-sample convergence state (flat over round_size)
-        u_ema      = np.full(round_size, np.nan, dtype=np.float64)
-        n_hits     = np.zeros(round_size, dtype=np.int32)
-        convergeds_np = np.zeros(round_size, dtype=bool)
-        iterations_np = np.zeros(round_size, dtype=np.int32)
-
-        ema_alpha = 0.1
-        n_hits_req = 3
-        n_checks = int(np.ceil(max_iter / check_every))
-
-        if progress:
-            pbar.reset(total=max_iter)
-
-        # Python convergence loop — syncs every check_every steps
-        for check_idx in range(n_checks):
-            if convergeds_np[:n_real].all():
-                break
-
-            f_dc, u_means = step_pmap(f_dc, solids_dc, F_rep)
-            # u_means : (D, C)
-            u_means_flat = np.asarray(u_means).reshape(round_size)  # host sync
-
-            it = (check_idx + 1) * check_every
-
-            for j in range(round_size):
-                if convergeds_np[j]:
+        if debug_convergence:
+            parts = []
+            for j in range(total_slots):
+                i = slot_sample[j]
+                if i == -1:
+                    parts.append(f"s{j}=idle")
                     continue
-                um = float(u_means_flat[j])
-                if np.isnan(u_ema[j]):
-                    u_ema[j] = um
-                    rel_err  = np.inf
-                else:
-                    u_ema_new = ema_alpha * um + (1.0 - ema_alpha) * u_ema[j]
-                    rel_err   = abs(u_ema_new - u_ema[j]) / (abs(u_ema[j]) + 1e-30)
-                    u_ema[j]  = u_ema_new
+                um    = float(u_means_f[j])
+                u_new = 0.1 * um + 0.9 * (u_ema[j] if not np.isnan(u_ema[j]) else um)
+                err   = abs(u_new - (u_ema[j] if not np.isnan(u_ema[j]) else u_new)) / (abs(u_ema[j]) + 1e-30) if not np.isnan(u_ema[j]) else float("inf")
+                parts.append(f"s{j}={err:.2e}({err/tol:.1f}x)")
+            print(f"  [iter {it:6d}] " + "  ".join(parts), flush=True)
 
-                if rel_err < tol:
-                    n_hits[j] += 1
-                else:
-                    n_hits[j] = 0
+        for j in range(total_slots):
+            i = slot_sample[j]
+            if i == -1:
+                continue
 
-                if n_hits[j] >= n_hits_req:
-                    convergeds_np[j] = True
-                    iterations_np[j] = it
+            um = float(u_means_f[j])
+            if np.isnan(u_ema[j]):
+                u_ema[j] = um
+                continue
 
-            if debug_convergence:
-                parts = []
-                for j in range(n_real):
-                    if convergeds_np[j]:
-                        parts.append(f"s{j}=✓")
-                    else:
-                        um = float(u_means_flat[j])
-                        u_new = ema_alpha * um + (1.0 - ema_alpha) * u_ema[j]
-                        err = abs(u_new - u_ema[j]) / (abs(u_ema[j]) + 1e-30)
-                        parts.append(f"s{j}={err:.2e}({err/tol:.1f}x tol)")
-                print(f"  [iter {it:6d}] " + "  ".join(parts), flush=True)
+            u_new    = 0.1 * um + 0.9 * u_ema[j]
+            rel_err  = abs(u_new - u_ema[j]) / (abs(u_ema[j]) + 1e-30)
+            u_ema[j] = u_new
 
-            if progress:
-                n_converged = int(convergeds_np[:n_real].sum())
-                pbar.n = min(it, max_iter)
-                pbar.set_postfix(converged=f"{n_converged}/{n_real}")
-                pbar.refresh()
+            if rel_err < tol:
+                n_hits[j] += 1
+            else:
+                n_hits[j] = 0
 
-        # For samples that never converged, record max_iter
-        for j in range(round_size):
-            if not convergeds_np[j]:
-                iterations_np[j] = max_iter
+            if n_hits[j] >= 3:
+                pp = _post_process(f_slots[j], solids_np[i], F_np,
+                                   d_idx, nu, force_mag)
 
-        f_finals_np = np.asarray(f_dc).reshape(round_size, N, 19)
+                permeabilities[i]  = pp["permeability"]
+                mean_velocities[i] = pp["mean_velocity"]
+                porosities[i]      = float((~solids_np[i]).mean())
+                machs[i]           = pp["mach"]
+                iterations_out[i]  = it
+                convergeds_out[i]  = True
+                u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
+                rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
 
-        # Post-process real samples
-        for j in range(n_real):
-            i       = r_start + j
-            solid_i = solids_np[i]
-            pp = _post_process(f_finals_np[j], solid_i, F_np,
-                               d_idx, nu, force_mag)
+                if pp["mach"] > 0.1:
+                    print(f"  WARNING sample {i}: Mach={pp['mach']:.3f}. "
+                          f"Reduce force_mag.")
 
-            permeabilities[i]  = pp["permeability"]
-            mean_velocities[i] = pp["mean_velocity"]
-            porosities[i]      = float((~solid_i).mean())
-            machs[i]           = pp["mach"]
-            iterations_out[i]  = iterations_np[j]
-            convergeds_out[i]  = convergeds_np[j]
-            u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
-            rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
-
-            if pp["mach"] > 0.1:
-                print(f"  WARNING sample {i}: Mach={pp['mach']:.3f}. "
-                      f"Reduce force_mag.")
-
-            if verbose:
                 dev_id = j // batch_size_per_device
-                status = "✓" if convergeds_np[j] else "✗"
-                print(f"  [{i:3d}] {status}  dev={dev_id}  "
-                      f"iters={iterations_np[j]:6d}  "
-                      f"φ={porosities[i]:.3f}  "
-                      f"k={permeabilities[i]:.4e} lu²  "
-                      f"Ma={machs[i]:.4f}")
+                if verbose:
+                    print(f"  [{i:3d}] ✓  dev={dev_id}  iters={it:6d}  "
+                          f"φ={porosities[i]:.3f}  "
+                          f"k={permeabilities[i]:.4e} lu²  "
+                          f"Ma={machs[i]:.4f}  "
+                          f"[slot {j} → ", end="")
+
+                if progress:
+                    pbar.update(1)
+
+                n_done += 1
+
+                if next_sample < B:
+                    ni = next_sample
+                    next_sample += 1
+                    slot_sample[j]  = ni
+                    solids_slots[j] = solids_np[ni]
+                    f_slots[j]      = _init_f(solids_np[ni])
+                    u_ema[j]        = np.nan
+                    n_hits[j]       = 0
+                    if verbose:
+                        print(f"sample {ni}]", flush=True)
+                else:
+                    slot_sample[j] = -1
+                    if verbose:
+                        print("idle]", flush=True)
+
+        if it >= max_iter:
+            for j in range(total_slots):
+                i = slot_sample[j]
+                if i == -1:
+                    continue
+                pp = _post_process(f_slots[j], solids_np[i], F_np,
+                                   d_idx, nu, force_mag)
+                permeabilities[i]  = pp["permeability"]
+                mean_velocities[i] = pp["mean_velocity"]
+                porosities[i]      = float((~solids_np[i]).mean())
+                machs[i]           = pp["mach"]
+                iterations_out[i]  = it
+                convergeds_out[i]  = False
+                u_fields[i]        = pp["u_flat"].reshape(Nx, Ny, Nz, 3)
+                rho_fields[i]      = pp["rho_flat"].reshape(Nx, Ny, Nz)
+                if verbose:
+                    dev_id = j // batch_size_per_device
+                    print(f"  [{i:3d}] ✗  dev={dev_id}  iters={it:6d}  "
+                          f"φ={porosities[i]:.3f}  "
+                          f"k={permeabilities[i]:.4e} lu²  "
+                          f"Ma={machs[i]:.4f}")
+            break
 
     if progress:
         pbar.close()
